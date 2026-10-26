@@ -150,9 +150,9 @@ interface ButtonBarStorage {
 
         <!-- Context Menu -->
         <div class="context-menu"
+             #contextMenu
              *ngIf="contextMenuVisible"
-             [style.left.px]="contextMenuPosition.x"
-             [style.top.px]="contextMenuPosition.y">
+             [ngStyle]="contextMenuStyles">
             <div class="context-menu-item" (click)="contextMenuEdit()">
                 <i class="fas fa-fw fa-edit"></i>
                 <span>Edit</span>
@@ -558,6 +558,8 @@ interface ButtonBarStorage {
             box-shadow: 0 4px 12px rgba(0,0,0,0.3);
             z-index: 10002;
             min-width: 140px;
+            max-width: calc(100vw - 16px);
+            box-sizing: border-box;
             padding: 4px 0;
             font-size: 12px;
         }
@@ -623,8 +625,9 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
 
     // Context menu state
     contextMenuVisible = false
-    contextMenuPosition = { x: 0, y: 0 }
+    contextMenuStyles: Record<string, string> = {}
     contextMenuButton: ButtonCommand | null = null
+    private contextMenuAnchor: DOMRect | null = null
 
     // List menu state
     listMenuVisible = false
@@ -645,6 +648,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
 
     @ViewChild('listToggleButton', { read: ElementRef }) private listToggleButton?: ElementRef<HTMLElement>
     @ViewChild('listMenu', { read: ElementRef }) private listMenuElement?: ElementRef<HTMLElement>
+    @ViewChild('contextMenu', { read: ElementRef }) private contextMenuElement?: ElementRef<HTMLElement>
 
     get activeList(): ButtonList | undefined {
         return this.lists.find(l => l.id === this.activeListId) || this.lists[0]
@@ -680,6 +684,8 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     @HostListener('document:click', ['$event'])
     onDocumentClick(_event: MouseEvent): void {
         this.contextMenuVisible = false
+        this.contextMenuStyles = {}
+        this.contextMenuAnchor = null
         this.closeListMenu()
     }
 
@@ -897,30 +903,22 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         event?.preventDefault()
         event?.stopPropagation()
         const terminal = this.getActiveTerminalTab()
-        const terminalAny = terminal as BaseTerminalTabComponent<any> & { inputProcessor?: { writeText?: (text: string) => void } }
 
         if (!terminal) {
             console.warn('ButtonBar: No terminal tab found')
             return
         }
 
-        const focusTerminal = () => terminalAny.frontend?.focus()
+        const focusTerminal = () => terminal.frontend?.focus()
 
         setTimeout(() => {
             focusTerminal()
             const sanitizedCommand = btn.command.replace(/\r?\n/g, ' ')
-            if (terminalAny.inputProcessor?.writeText) {
-                terminalAny.inputProcessor.writeText(sanitizedCommand)
-                if (btn.sendEnter === true) {
-                    terminalAny.sendInput('\n')
-                }
-            } else if (terminalAny.sendInput) {
-                let command = sanitizedCommand
-                if (btn.sendEnter === true) {
-                    command += '\n'
-                }
-                terminalAny.sendInput(command)
-            }
+            // Enter must be a lone CR (0x0D), not LF (0x0A). Windows ConPTY
+            // translates LF into Ctrl+Enter, which PSReadLine binds to
+            // InsertLineAbove - that only opens a ">>" continuation line and
+            // never submits the command (see issue: PowerShell 7 send-enter).
+            terminal.sendInput(sanitizedCommand + (btn.sendEnter === true ? '\r' : ''))
             setTimeout(focusTerminal, 20)
         }, 10)
     }
@@ -977,6 +975,9 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     onWindowResize(): void {
         if (this.listMenuVisible) {
             this.positionListMenu()
+        }
+        if (this.contextMenuVisible) {
+            this.positionContextMenu()
         }
     }
 
@@ -1120,7 +1121,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 sendEnter: this.modalData.sendEnter,
             })
         } else {
-            const commandText = this.modalData.command!.replace(/\\r?\\n/g, ' ')
+            const commandText = this.modalData.command!.replace(/\r?\n/g, ' ')
             const newButton: ButtonCommand = {
                 id: this.generateId(),
                 label: this.modalData.label!,
@@ -1141,10 +1142,74 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     onButtonContextMenu(event: MouseEvent, btn: ButtonCommand): void {
         event.preventDefault()
         event.stopPropagation()
-        
+
+        const target = event.currentTarget as HTMLElement | null
         this.contextMenuButton = btn
-        this.contextMenuPosition = { x: event.clientX, y: event.clientY - 105 }
+        this.contextMenuAnchor = target?.getBoundingClientRect() ?? null
+
+        // Render hidden first, then measure the real menu size before placing it.
+        this.contextMenuStyles = { left: '0px', top: '0px', visibility: 'hidden' }
         this.contextMenuVisible = true
+        requestAnimationFrame(() => this.positionContextMenu())
+    }
+
+    /**
+     * Place the context menu inside the viewport:
+     * prefer above the button (the bar sits at the bottom), flip below if needed,
+     * clamp both axes to an 8px margin, and let it scroll internally when it is
+     * taller than the viewport.
+     */
+    private positionContextMenu(): void {
+        const el = this.contextMenuElement?.nativeElement
+        const anchor = this.contextMenuAnchor
+        if (!el || !anchor) {
+            return
+        }
+
+        const margin = 8
+        const gap = 6
+        const vw = window.innerWidth || document.documentElement.clientWidth
+        const vh = window.innerHeight || document.documentElement.clientHeight
+
+        // Measure the natural size (clear constraints from a previous opening).
+        el.style.maxHeight = ''
+        el.style.maxWidth = ''
+        el.style.minWidth = ''
+        el.style.overflowY = ''
+        const natural = el.getBoundingClientRect()
+        let width = natural.width
+        let height = natural.height
+
+        let top = anchor.top - gap - height
+        if (top < margin) {
+            if (anchor.bottom + gap + height <= vh - margin) {
+                top = anchor.bottom + gap
+            } else {
+                height = Math.max(vh - margin * 2, 0)
+                el.style.maxHeight = `${height}px`
+                el.style.overflowY = 'auto'
+                top = margin
+            }
+        }
+        top = Math.min(Math.max(top, margin), Math.max(margin, vh - margin - height))
+
+        if (width > vw - margin * 2) {
+            width = Math.max(vw - margin * 2, 0)
+            el.style.minWidth = '0'
+            el.style.maxWidth = `${width}px`
+            el.style.overflowX = 'auto'
+        }
+        let left = anchor.left
+        if (left + width > vw - margin) {
+            left = anchor.right - width
+        }
+        left = Math.min(Math.max(left, margin), Math.max(margin, vw - margin - width))
+
+        this.contextMenuStyles = {
+            left: `${Math.round(left)}px`,
+            top: `${Math.round(top)}px`,
+            visibility: 'visible',
+        }
     }
 
     contextMenuEdit(): void {

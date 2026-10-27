@@ -39,8 +39,8 @@ interface ButtonBarStorage {
 @Component({
     selector: 'button-bar',
     template: `
-        <div class="button-bar-container">
-            <div class="button-bar-main">
+        <div class="button-bar-container" [class.collapsed]="collapsed">
+            <div class="button-bar-main" *ngIf="!collapsed">
                 <div class="list-selector">
                     <button class="list-toggle" #listToggleButton (click)="toggleListMenu($event)">
                         <span>{{ activeList?.name || 'Lists' }}</span>
@@ -90,11 +90,14 @@ interface ButtonBarStorage {
                     </button>
                 </div>
                 <div class="button-bar-actions">
-                    <button class="action-btn" (click)="toggleCollapse()" title="Hide button bar">
+                    <button class="action-btn" (click)="collapse()" title="Collapse button bar">
                         <i class="fas fa-chevron-down"></i>
                     </button>
                 </div>
             </div>
+            <button *ngIf="collapsed" class="expand-btn" (click)="expand()" title="Expand button bar">
+                <i class="fas fa-chevron-up"></i>
+            </button>
         </div>
 
         <!-- Add/Edit Command Modal -->
@@ -254,6 +257,32 @@ interface ButtonBarStorage {
 
         :host.platform-linux .button-bar-container {
             padding: 6px 6px;
+        }
+
+        .button-bar-container.collapsed {
+            padding: 2px 6px;
+            justify-content: flex-end;
+        }
+
+        .expand-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 30px;
+            height: 16px;
+            padding: 0;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            color: var(--bs-secondary-color, #888);
+            cursor: pointer;
+            font-size: 10px;
+        }
+
+        .expand-btn:hover {
+            border-color: var(--bs-border-color, #555);
+            color: var(--bs-body-color, #e0e0e0);
+            background: rgba(255,255,255,0.05);
         }
 
         .button-bar-main {
@@ -482,6 +511,9 @@ interface ButtonBarStorage {
             box-shadow: 0 8px 32px rgba(0,0,0,0.3);
             z-index: 10001;
             width: min(420px, 90vw);
+            max-height: calc(100vh - 32px);
+            overflow-y: auto;
+            box-sizing: border-box;
         }
 
         .modal-header {
@@ -628,6 +660,9 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     contextMenuStyles: Record<string, string> = {}
     contextMenuButton: ButtonCommand | null = null
     private contextMenuAnchor: DOMRect | null = null
+
+    // Collapse state (collapses to a slim strip with an expand button)
+    collapsed = false
 
     // List menu state
     listMenuVisible = false
@@ -841,10 +876,12 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         return 'btn_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 7)
     }
 
-    toggleCollapse(): void {
-        if (this.barService) {
-            this.barService.hide()
-        }
+    collapse(): void {
+        this.collapsed = true
+    }
+
+    expand(): void {
+        this.collapsed = false
     }
 
     private findTerminalTab(tab: BaseTabComponent | null): BaseTerminalTabComponent<any> | null {

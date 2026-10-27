@@ -12,8 +12,15 @@ import {
 import { BaseTerminalTabComponent } from 'tabby-terminal'
 import path from 'node:path'
 import { existsSync, readFileSync, renameSync } from 'node:fs'
-import { Subject } from 'rxjs'
+import { Subject, Subscription } from 'rxjs'
 import { takeUntil } from 'rxjs/operators'
+
+export interface ButtonWait {
+    /** Substring or regular expression to wait for in the terminal output. */
+    pattern: string
+    /** Timeout in seconds (default 30). */
+    timeout?: number
+}
 
 export interface ButtonCommand {
     id: string
@@ -23,6 +30,8 @@ export interface ButtonCommand {
     icon?: string
     tooltip?: string
     sendEnter?: boolean
+    /** waits[i] applies before sending line i+1 of a multi-line command. */
+    waits?: (ButtonWait | null)[]
 }
 
 export interface ButtonList {
@@ -64,6 +73,9 @@ interface ButtonBarStorage {
                             </div>
                         </ng-container>
                         <div class="list-menu-footer">
+                            <button class="btn-link btn-sm" (click)="openEditLists($event)">
+                                <i class="fas fa-list"></i> Edit lists
+                            </button>
                             <button class="btn-link btn-sm" (click)="openImportExportModal($event)">
                                 <i class="fas fa-cog"></i> Import/Export
                             </button>
@@ -72,17 +84,19 @@ interface ButtonBarStorage {
                 </div>
                 <div class="button-bar-buttons">
                     <ng-container *ngIf="activeList">
-                        <button *ngFor="let btn of activeList.buttons"
+                        <button *ngFor="let btn of activeList.buttons; trackBy: trackByButton"
                                 class="cmd-btn"
                                 tabindex="-1"
+                                [class.dragging]="draggingButton === btn"
+                                [attr.data-btn-id]="btn.id"
                                 [style.--btn-color]="btn.color || '#4a4a4a'"
                                 [title]="btn.tooltip || btn.command"
                                 (click)="executeCommand(btn, $event)"
-                                (mousedown)="$event.preventDefault()"
-                                (mouseup)="$event.preventDefault()"
+                                (pointerdown)="onButtonPointerDown($event, btn)"
                                 (contextmenu)="onButtonContextMenu($event, btn)">
                             <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
                             <span>{{ btn.label }}</span>
+                            <i *ngIf="btn.waits?.length" class="fas fa-clock wait-indicator" title="Wait steps configured"></i>
                         </button>
                     </ng-container>
                     <button class="cmd-btn cmd-btn-add" (click)="openAddModal()" title="Add command">
@@ -115,8 +129,27 @@ interface ButtonBarStorage {
                     <input type="text" class="form-control" [(ngModel)]="modalData.label" placeholder="e.g., List Files">
                 </div>
                 <div class="form-group mb-3">
-                    <label class="form-label">Command</label>
-                    <input type="text" class="form-control" [(ngModel)]="modalData.command" placeholder="e.g., ls -la">
+                    <label class="form-label">Command <small class="text-muted">(one command per line)</small></label>
+                    <textarea class="form-control command-textarea" rows="3"
+                              [ngModel]="modalData.command"
+                              (ngModelChange)="onCommandInput($event)"
+                              placeholder="e.g., adb push ...  (new line)  adb shell ..."></textarea>
+                </div>
+                <div class="form-group mb-3" *ngIf="modalWaitRows.length > 0">
+                    <label class="form-label">Wait for output before next line <small class="text-muted">(optional)</small></label>
+                    <div class="wait-row" *ngFor="let wait of modalWaitRows; let i = index">
+                        <span class="wait-line-label">Line {{ i + 2 }}</span>
+                        <input type="text" class="form-control wait-pattern"
+                               [(ngModel)]="wait.pattern"
+                               placeholder="text or regex, e.g. Password: / 100%">
+                        <input type="number" class="form-control wait-timeout"
+                               [(ngModel)]="wait.timeout" min="1" placeholder="30">
+                        <span class="wait-timeout-unit">s</span>
+                    </div>
+                    <small class="text-muted">
+                        The next line is sent only after terminal output matches (substring or regex).
+                        Timeout aborts the remaining lines (default 30s).
+                    </small>
                 </div>
                 <div class="form-group mb-3">
                     <label class="form-label">Icon (FontAwesome name, optional)</label>
@@ -164,10 +197,104 @@ interface ButtonBarStorage {
                 <i class="fas fa-fw fa-copy"></i>
                 <span>Duplicate</span>
             </div>
+            <div class="context-menu-item" (click)="openMoveCopyModal('move')">
+                <i class="fas fa-fw fa-arrow-right"></i>
+                <span>Move to list</span>
+            </div>
+            <div class="context-menu-item" (click)="openMoveCopyModal('copy')">
+                <i class="fas fa-fw fa-clone"></i>
+                <span>Copy to list</span>
+            </div>
             <div class="context-menu-divider"></div>
             <div class="context-menu-item context-menu-item-danger" (click)="contextMenuDelete()">
                 <i class="fas fa-fw fa-trash-alt"></i>
                 <span>Delete</span>
+            </div>
+        </div>
+
+        <!-- Move / Copy to List Modal -->
+        <div class="modal-backdrop" *ngIf="moveCopyModalVisible" (click)="closeMoveCopyModal()"></div>
+        <div class="command-modal" *ngIf="moveCopyModalVisible">
+            <div class="modal-header">
+                <h5>{{ moveCopyMode === 'move' ? 'Move to List' : 'Copy to List' }}</h5>
+                <button class="btn btn-link" (click)="closeMoveCopyModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="move-copy-source" *ngIf="moveCopyButton">{{ moveCopyButton.label }}</div>
+                <div class="list-choice-list">
+                    <button *ngFor="let list of lists"
+                            class="btn btn-secondary list-choice"
+                            [disabled]="list.id === moveCopySourceListId"
+                            (click)="applyMoveCopy(list)">
+                        <span>{{ list.name }}</span>
+                        <small>{{ list.buttons.length }} buttons</small>
+                    </button>
+                </div>
+                <p class="text-muted" *ngIf="lists.length <= 1">Create another list first.</p>
+            </div>
+        </div>
+
+        <!-- Edit Lists Modal -->
+        <div class="modal-backdrop" *ngIf="editListsVisible" (click)="closeEditLists()"></div>
+        <div class="edit-lists-modal" *ngIf="editListsVisible">
+            <div class="modal-header">
+                <h5>Edit Lists</h5>
+                <button class="btn btn-link" (click)="closeEditLists()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body edit-lists-body">
+                <p class="edit-lists-hint text-muted">
+                    Drag a button onto another list to <strong>Copy</strong> or <strong>Move</strong> it.
+                    Drag it between buttons of the same list to reorder.
+                </p>
+                <div class="edit-list-section"
+                     *ngFor="let list of lists"
+                     (dragover)="onEditListDragOver(list, $event)"
+                     (dragleave)="onEditListDragLeave(list, $event)">
+                    <div class="edit-list-title">
+                        <strong>{{ list.name }}</strong>
+                        <span class="edit-list-count">{{ list.buttons.length }}</span>
+                    </div>
+                    <div class="edit-list-buttons">
+                        <div class="edit-button-row"
+                             *ngFor="let btn of list.buttons; trackBy: trackByButton"
+                             draggable="true"
+                             [class.drop-before]="isEditRowDropTarget(list, btn, 'before')"
+                             [class.drop-after]="isEditRowDropTarget(list, btn, 'after')"
+                             (dragstart)="onEditButtonDragStart(list, btn, $event)"
+                             (dragend)="onEditButtonDragEnd()"
+                             (dragover)="onEditRowDragOver(list, btn, $event)"
+                             (dragleave)="onEditRowDragLeave(list, btn, $event)"
+                             (drop)="onEditRowDrop(list, btn, $event)">
+                            <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
+                            <span class="edit-button-label">{{ btn.label }}</span>
+                            <small class="edit-button-command">{{ btn.command }}</small>
+                        </div>
+                        <div *ngIf="list.buttons.length === 0" class="text-muted edit-list-empty">
+                            No buttons
+                        </div>
+                    </div>
+                    <div class="edit-drop-overlay" *ngIf="isEditDropTarget(list)">
+                        <div class="edit-drop-zone edit-drop-copy"
+                             (dragover)="$event.preventDefault(); $event.stopPropagation()"
+                             (drop)="dropEditButton(list, 'copy', $event)">
+                            <i class="fas fa-clone"></i>
+                            <span>Copy here</span>
+                        </div>
+                        <div class="edit-drop-zone edit-drop-move"
+                             (dragover)="$event.preventDefault(); $event.stopPropagation()"
+                             (drop)="dropEditButton(list, 'move', $event)">
+                            <i class="fas fa-arrow-right"></i>
+                            <span>Move here</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" (click)="closeEditLists()">Close</button>
             </div>
         </div>
 
@@ -358,6 +485,10 @@ interface ButtonBarStorage {
             border-top: 1px solid var(--bs-border-color, #444);
             margin-top: 4px;
             padding-top: 6px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 4px;
         }
 
         .list-menu-footer .btn-sm {
@@ -454,9 +585,21 @@ interface ButtonBarStorage {
             font-size: 10px;
         }
 
+        .cmd-btn .wait-indicator {
+            font-size: 8px;
+            opacity: 0.65;
+            margin-left: 1px;
+        }
+
         .cmd-btn:hover {
             filter: brightness(1.15);
             border-color: rgba(255,255,255,0.2);
+        }
+
+        .cmd-btn.dragging {
+            opacity: 0.35;
+            outline: 1px dashed var(--bs-primary, #0d6efd);
+            pointer-events: none;
         }
 
         .cmd-btn-add {
@@ -546,6 +689,39 @@ interface ButtonBarStorage {
             font-size: 13px;
         }
 
+        .command-textarea {
+            font-family: var(--bs-font-monospace, monospace);
+            min-height: 64px;
+            resize: vertical;
+        }
+
+        .wait-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+
+        .wait-line-label {
+            flex: 0 0 52px;
+            font-size: 11px;
+            opacity: 0.7;
+        }
+
+        .wait-pattern {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        .wait-timeout {
+            flex: 0 0 64px;
+        }
+
+        .wait-timeout-unit {
+            font-size: 11px;
+            opacity: 0.7;
+        }
+
         .color-picker {
             display: flex;
             align-items: center;
@@ -585,6 +761,190 @@ interface ButtonBarStorage {
             gap: 8px;
             padding: 12px 16px;
             border-top: 1px solid var(--bs-border-color);
+        }
+
+        .move-copy-source {
+            font-size: 13px;
+            font-weight: 600;
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: var(--bs-tertiary-bg);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .list-choice-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .list-choice {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            text-align: left;
+        }
+
+        .list-choice small {
+            opacity: 0.7;
+        }
+
+        .edit-lists-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: min(960px, 92vw);
+            max-height: 82vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--bs-body-bg);
+            border: 1px solid var(--bs-border-color);
+            border-radius: 8px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+            z-index: 10001;
+            box-sizing: border-box;
+        }
+
+        .edit-lists-body {
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            align-items: flex-start;
+            flex: 1 1 auto;
+            gap: 12px;
+            overflow-y: auto;
+            min-height: 0;
+        }
+
+        .edit-lists-hint {
+            flex: 0 0 100%;
+            margin: 0 0 4px;
+            font-size: 12px;
+        }
+
+        .edit-list-section {
+            position: relative;
+            flex: 1 1 260px;
+            min-width: 240px;
+            max-width: 460px;
+            border: 1px solid var(--bs-border-color);
+            border-radius: 8px;
+            padding: 10px;
+            background: var(--bs-tertiary-bg, #232323);
+            box-sizing: border-box;
+        }
+
+        .edit-list-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+
+        .edit-list-count {
+            min-width: 20px;
+            padding: 0 6px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.12);
+            text-align: center;
+            font-size: 11px;
+        }
+
+        .edit-list-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-height: 32px;
+        }
+
+        .edit-button-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 8px;
+            border: 1px solid var(--bs-border-color);
+            border-radius: 4px;
+            background: var(--bs-body-bg);
+            cursor: grab;
+            user-select: none;
+            font-size: 12px;
+        }
+
+        .edit-button-row:active {
+            cursor: grabbing;
+        }
+
+        .edit-button-row.drop-before {
+            box-shadow: inset 0 2px 0 var(--bs-primary, #0d6efd);
+        }
+
+        .edit-button-row.drop-after {
+            box-shadow: inset 0 -2px 0 var(--bs-primary, #0d6efd);
+        }
+
+        .edit-button-label {
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .edit-button-command {
+            margin-left: auto;
+            max-width: 55%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            opacity: 0.65;
+        }
+
+        .edit-list-empty {
+            font-size: 11px;
+            padding: 4px 2px;
+        }
+
+        .edit-drop-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            gap: 6px;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.72);
+            border-radius: 8px;
+            z-index: 2;
+        }
+
+        .edit-drop-zone {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border: 2px dashed;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: copy;
+        }
+
+        .edit-drop-zone:hover {
+            background: rgba(255,255,255,0.08);
+        }
+
+        .edit-drop-copy {
+            border-color: #0d6efd;
+            color: #6ea8fe;
+        }
+
+        .edit-drop-move {
+            border-color: #198754;
+            color: #75b798;
         }
 
         .context-menu {
@@ -658,6 +1018,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     // Modal state
     modalVisible = false
     modalData: Partial<ButtonCommand> & { sendEnter?: boolean } = {}
+    modalWaitRows: { pattern: string; timeout?: number }[] = []
     editingButton: ButtonCommand | null = null
 
     // Context menu state
@@ -669,9 +1030,32 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     // Collapse state (collapses to a slim strip with an expand button)
     collapsed = false
 
+    // Drag-to-reorder state (long press, then drag)
+    draggingButton: ButtonCommand | null = null
+    private pendingDragButton: ButtonCommand | null = null
+    private longPressTimer: ReturnType<typeof setTimeout> | null = null
+    private pointerStart = { x: 0, y: 0 }
+    private dragArmed = false
+    private dragMoved = false
+    private suppressClick = false
+
     // List menu state
     listMenuVisible = false
     listMenuStyles: Record<string, string> = {}
+
+    // Move/Copy to list modal
+    moveCopyModalVisible = false
+    moveCopyMode: 'move' | 'copy' = 'move'
+    moveCopyButton: ButtonCommand | null = null
+    moveCopySourceListId = ''
+
+    // Edit Lists modal (drag buttons between lists)
+    editListsVisible = false
+    editDragButton: ButtonCommand | null = null
+    editDragSourceListId = ''
+    editDragOverListId: string | null = null
+    editDragRowId: string | null = null
+    editDragRowPosition: 'before' | 'after' = 'before'
 
     // Import/Export modal
     importExportModalVisible = false
@@ -716,6 +1100,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         private config: ConfigService,
         private hostApp: HostAppService,
         private platformService: PlatformService,
+        private hostElement: ElementRef<HTMLElement>,
     ) {
         super()
         this.isMacOS = this.hostApp.platform === Platform.macOS
@@ -990,6 +1375,10 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     executeCommand(btn: ButtonCommand, event?: MouseEvent): void {
         event?.preventDefault()
         event?.stopPropagation()
+        if (this.suppressClick) {
+            this.suppressClick = false
+            return
+        }
         const terminal = this.getActiveTerminalTab()
 
         if (!terminal) {
@@ -997,17 +1386,195 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             return
         }
 
-        const focusTerminal = () => terminal.frontend?.focus()
-
         setTimeout(() => {
-            focusTerminal()
-            // Enter must be a lone CR (0x0D), not LF (0x0A): Windows ConPTY
-            // translates LF into Ctrl+Enter, which PSReadLine binds to
-            // InsertLineAbove - the command would only open a ">>" line.
-            const sanitizedCommand = btn.command.replace(/\r?\n/g, ' ')
-            terminal.sendInput(sanitizedCommand + (btn.sendEnter === true ? '\r' : ''))
-            setTimeout(focusTerminal, 20)
+            void this.runCommandSteps(terminal, btn).catch(error => {
+                console.error('ButtonBar: command execution failed', error)
+            })
         }, 10)
+    }
+
+    /**
+     * Execute a button command line by line. If a line has a wait
+     * configuration, subscribe to the session output before sending that line
+     * so fast output is not missed, then send the next line only after the
+     * pattern matches (or abort on timeout).
+     */
+    private async runCommandSteps(terminal: BaseTerminalTabComponent<any>, btn: ButtonCommand): Promise<void> {
+        console.log('ButtonBar: executing', btn.label, 'waits=', btn.waits)
+        terminal.frontend?.focus()
+        const body = btn.command.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        if (!body) {
+            return
+        }
+        const lines = body.split('\n')
+        const waits = btn.waits ?? []
+
+        for (let i = 0; i < lines.length; i++) {
+            const wait = i < lines.length - 1 ? waits[i] : null
+            const waitPromise = wait?.pattern
+                ? this.waitForOutput(terminal, wait.pattern, (wait.timeout ?? 30) * 1000)
+                : null
+
+            const isLast = i === lines.length - 1
+            const enter = !isLast || btn.sendEnter === true
+            terminal.sendInput(lines[i] + (enter ? '\r' : ''))
+
+            if (waitPromise) {
+                const matched = await waitPromise
+                if (!matched) {
+                    console.warn('ButtonBar: timed out waiting for "' + wait?.pattern + '"')
+                    return
+                }
+            }
+        }
+
+        setTimeout(() => terminal.frontend?.focus(), 20)
+    }
+
+    private waitForOutput(terminal: BaseTerminalTabComponent<any>, pattern: string, timeoutMs: number): Promise<boolean> {
+        return new Promise(resolve => {
+            const session = terminal.session
+            if (!session?.output$) {
+                resolve(false)
+                return
+            }
+
+            let buffer = ''
+            let settled = false
+            let subscription: Subscription | null = null
+            let timer: ReturnType<typeof setTimeout> | null = null
+
+            const finish = (matched: boolean): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                subscription?.unsubscribe()
+                if (timer) {
+                    clearTimeout(timer)
+                }
+                resolve(matched)
+            }
+
+            console.log('ButtonBar: waiting for output', JSON.stringify(pattern))
+            timer = setTimeout(() => finish(false), Math.max(timeoutMs, 500))
+            subscription = session.output$.subscribe({
+                next: data => {
+                    buffer = (buffer + this.stripAnsi(data)).slice(-65536)
+                    if (this.outputMatches(buffer, pattern)) {
+                        console.log('ButtonBar: output matched', JSON.stringify(pattern))
+                        finish(true)
+                    }
+                },
+                error: () => finish(false),
+                complete: () => finish(false),
+            })
+        })
+    }
+
+    private outputMatches(buffer: string, pattern: string): boolean {
+        if (buffer.includes(pattern)) {
+            return true
+        }
+        try {
+            return new RegExp(pattern).test(buffer)
+        } catch {
+            return false
+        }
+    }
+
+    private stripAnsi(text: string): string {
+        return text
+            .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+            .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+            .replace(/\x1b[@-Z\\-_]/g, '')
+    }
+
+    // Drag-to-reorder
+    trackByButton(_index: number, btn: ButtonCommand): string {
+        return btn.id
+    }
+
+    onButtonPointerDown(event: PointerEvent, btn: ButtonCommand): void {
+        if (event.button !== 0) {
+            return
+        }
+        this.cancelLongPress()
+        this.pendingDragButton = btn
+        this.draggingButton = null
+        this.dragArmed = false
+        this.dragMoved = false
+        this.pointerStart = { x: event.clientX, y: event.clientY }
+        this.longPressTimer = setTimeout(() => {
+            this.longPressTimer = null
+            if (this.pendingDragButton === btn) {
+                this.dragArmed = true
+            }
+        }, 250)
+    }
+
+    @HostListener('document:pointermove', ['$event'])
+    onDocumentPointerMove(event: PointerEvent): void {
+        if (!this.dragArmed || !this.pendingDragButton) {
+            return
+        }
+        const dx = event.clientX - this.pointerStart.x
+        const dy = event.clientY - this.pointerStart.y
+        if (!this.dragMoved && Math.hypot(dx, dy) < 6) {
+            return
+        }
+        if (!this.dragMoved) {
+            this.dragMoved = true
+            this.draggingButton = this.pendingDragButton
+            this.suppressClick = true
+        }
+        this.reorderButtonAtPoint(event.clientX, event.clientY)
+    }
+
+    @HostListener('document:pointerup')
+    @HostListener('document:pointercancel')
+    onDocumentPointerUp(): void {
+        this.cancelLongPress()
+        const wasDragging = this.draggingButton !== null
+        this.draggingButton = null
+        this.pendingDragButton = null
+        this.dragArmed = false
+        this.dragMoved = false
+        if (wasDragging) {
+            this.saveLists()
+            // The click event (if any) is dispatched right after pointerup;
+            // reset the flag afterwards so normal clicks keep working.
+            setTimeout(() => {
+                this.suppressClick = false
+            }, 0)
+        }
+    }
+
+    private cancelLongPress(): void {
+        if (this.longPressTimer) {
+            clearTimeout(this.longPressTimer)
+            this.longPressTimer = null
+        }
+    }
+
+    private reorderButtonAtPoint(x: number, y: number): void {
+        const list = this.activeList
+        const dragging = this.draggingButton
+        if (!list || !dragging) {
+            return
+        }
+        const element = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest('button.cmd-btn') as HTMLElement | null
+        const targetId = element?.dataset.btnId
+        if (!targetId) {
+            return
+        }
+        const from = list.buttons.indexOf(dragging)
+        const to = list.buttons.findIndex(btn => btn.id === targetId)
+        if (from === -1 || to === -1 || from === to) {
+            return
+        }
+        const [moved] = list.buttons.splice(from, 1)
+        list.buttons.splice(to, 0, moved)
     }
 
     // List menu
@@ -1066,6 +1633,219 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         if (this.contextMenuVisible) {
             this.positionContextMenu()
         }
+    }
+
+    // Move / Copy to list
+    openMoveCopyModal(mode: 'move' | 'copy'): void {
+        if (!this.contextMenuButton) {
+            return
+        }
+        this.moveCopyMode = mode
+        this.moveCopyButton = this.contextMenuButton
+        this.moveCopySourceListId = this.activeListId
+        this.moveCopyModalVisible = true
+        this.closeContextMenu()
+    }
+
+    closeMoveCopyModal(): void {
+        this.moveCopyModalVisible = false
+        this.moveCopyButton = null
+        this.moveCopySourceListId = ''
+    }
+
+    applyMoveCopy(target: ButtonList): void {
+        const source = this.lists.find(list => list.id === this.moveCopySourceListId)
+        const button = this.moveCopyButton
+        if (!source || !button || target.id === source.id) {
+            return
+        }
+
+        if (this.moveCopyMode === 'move') {
+            const index = source.buttons.indexOf(button)
+            if (index === -1) {
+                return
+            }
+            source.buttons.splice(index, 1)
+            target.buttons.push(button)
+        } else {
+            target.buttons.push({
+                ...button,
+                id: this.generateId(),
+            })
+        }
+
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to move/copy button', error)
+        } finally {
+            this.closeMoveCopyModal()
+        }
+    }
+
+    // Edit Lists modal
+    openEditLists(event?: MouseEvent): void {
+        event?.preventDefault()
+        event?.stopPropagation()
+        this.closeListMenu()
+        this.editListsVisible = true
+    }
+
+    closeEditLists(): void {
+        this.clearEditDrag()
+        this.editListsVisible = false
+    }
+
+    onEditButtonDragStart(list: ButtonList, btn: ButtonCommand, event: DragEvent): void {
+        this.editDragButton = btn
+        this.editDragSourceListId = list.id
+        this.editDragOverListId = null
+        if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = 'copyMove'
+            event.dataTransfer.setData('text/plain', btn.id)
+        }
+    }
+
+    onEditButtonDragEnd(): void {
+        this.clearEditDrag()
+    }
+
+    onEditListDragOver(list: ButtonList, event: DragEvent): void {
+        if (!this.editDragButton) {
+            return
+        }
+        if (list.id === this.editDragSourceListId) {
+            // Returning to the source list: hide a copy/move overlay that may
+            // still be visible on the previous target.
+            this.editDragOverListId = null
+            return
+        }
+        event.preventDefault()
+        this.editDragOverListId = list.id
+        this.editDragRowId = null
+    }
+
+    onEditListDragLeave(list: ButtonList, event: DragEvent): void {
+        if (this.editDragOverListId !== list.id) {
+            return
+        }
+        const current = event.currentTarget as HTMLElement
+        const related = event.relatedTarget as Node | null
+        if (related && current.contains(related)) {
+            return
+        }
+        this.editDragOverListId = null
+    }
+
+    isEditDropTarget(list: ButtonList): boolean {
+        return this.editDragButton !== null
+            && this.editDragSourceListId !== list.id
+            && this.editDragOverListId === list.id
+    }
+
+    onEditRowDragOver(list: ButtonList, btn: ButtonCommand, event: DragEvent): void {
+        if (!this.editDragButton || list.id !== this.editDragSourceListId) {
+            return
+        }
+        this.editDragOverListId = null
+        if (btn === this.editDragButton) {
+            return
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+        this.editDragRowId = btn.id
+        this.editDragRowPosition = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before'
+    }
+
+    onEditRowDragLeave(list: ButtonList, btn: ButtonCommand, event?: DragEvent): void {
+        if (this.editDragRowId !== btn.id) {
+            return
+        }
+        const current = event?.currentTarget as HTMLElement | null
+        const related = event?.relatedTarget as Node | null
+        if (current && related && current.contains(related)) {
+            return
+        }
+        this.editDragRowId = null
+    }
+
+    isEditRowDropTarget(list: ButtonList, btn: ButtonCommand, position: 'before' | 'after'): boolean {
+        return this.editDragButton !== null
+            && list.id === this.editDragSourceListId
+            && this.editDragRowId === btn.id
+            && this.editDragButton !== btn
+            && this.editDragRowPosition === position
+    }
+
+    onEditRowDrop(list: ButtonList, targetBtn: ButtonCommand, event: DragEvent): void {
+        event.preventDefault()
+        event.stopPropagation()
+        const dragging = this.editDragButton
+        if (!dragging || list.id !== this.editDragSourceListId || dragging === targetBtn) {
+            this.clearEditDrag()
+            return
+        }
+        const from = list.buttons.indexOf(dragging)
+        const targetIndex = list.buttons.indexOf(targetBtn)
+        if (from === -1 || targetIndex === -1) {
+            this.clearEditDrag()
+            return
+        }
+        let insertIndex = targetIndex + (this.editDragRowPosition === 'after' ? 1 : 0)
+        if (from < insertIndex) {
+            insertIndex--
+        }
+        const [moved] = list.buttons.splice(from, 1)
+        list.buttons.splice(insertIndex, 0, moved)
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to reorder button', error)
+        } finally {
+            this.clearEditDrag()
+        }
+    }
+
+    dropEditButton(target: ButtonList, mode: 'move' | 'copy', event: DragEvent): void {
+        event.preventDefault()
+        event.stopPropagation()
+        const button = this.editDragButton
+        const source = this.lists.find(list => list.id === this.editDragSourceListId)
+        if (!button || !source || target.id === source.id) {
+            this.clearEditDrag()
+            return
+        }
+
+        if (mode === 'move') {
+            const index = source.buttons.indexOf(button)
+            if (index === -1) {
+                this.clearEditDrag()
+                return
+            }
+            source.buttons.splice(index, 1)
+            target.buttons.push(button)
+        } else {
+            target.buttons.push({
+                ...button,
+                id: this.generateId(),
+            })
+        }
+
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to apply edit-lists drop', error)
+        } finally {
+            this.clearEditDrag()
+        }
+    }
+
+    private clearEditDrag(): void {
+        this.editDragButton = null
+        this.editDragSourceListId = ''
+        this.editDragOverListId = null
+        this.editDragRowId = null
     }
 
     // List operations
@@ -1177,12 +1957,14 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             tooltip: '',
             sendEnter: false,
         }
+        this.modalWaitRows = []
         this.modalVisible = true
     }
 
     openEditModal(btn: ButtonCommand): void {
         this.editingButton = btn
         this.modalData = { ...btn }
+        this.modalWaitRows = this.buildWaitRows(btn)
         this.modalVisible = true
     }
 
@@ -1190,6 +1972,76 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         this.modalVisible = false
         this.editingButton = null
         this.modalData = {}
+        this.modalWaitRows = []
+    }
+
+    onCommandInput(value: string): void {
+        this.modalData.command = value ?? ''
+        this.syncModalWaitRows()
+    }
+
+    private syncModalWaitRows(): void {
+        const body = (this.modalData.command ?? '').replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        const needed = Math.max(body.split('\n').length - 1, 0)
+        if (this.modalWaitRows.length > needed) {
+            this.modalWaitRows = this.modalWaitRows.slice(0, needed)
+        }
+        while (this.modalWaitRows.length < needed) {
+            this.modalWaitRows.push({ pattern: '', timeout: 30 })
+        }
+    }
+
+    private buildWaitRows(btn: ButtonCommand): { pattern: string; timeout?: number }[] {
+        const body = (btn.command ?? '').replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        const needed = Math.max(body.split('\n').length - 1, 0)
+        const rows: { pattern: string; timeout?: number }[] = []
+        for (let i = 0; i < needed; i++) {
+            const wait = btn.waits?.[i]
+            rows.push({
+                pattern: wait?.pattern ?? '',
+                timeout: wait?.timeout ?? 30,
+            })
+        }
+        return rows
+    }
+
+    private buildWaitsForSave(): (ButtonWait | null)[] | undefined {
+        const modelWaits = this.modalWaitRows.map(wait => {
+            const pattern = wait.pattern?.trim()
+            if (!pattern) {
+                return null
+            }
+            const timeout = Number(wait.timeout)
+            return {
+                pattern,
+                timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
+            }
+        })
+
+        // Safety net: read the rendered inputs directly as well. If an
+        // ngModel control in a dynamic *ngFor row has not synced for any
+        // reason, the user-typed text still ends up in the saved command.
+        const root = this.hostElement?.nativeElement
+        if (root) {
+            const patternInputs = Array.from(root.querySelectorAll('input.wait-pattern')) as HTMLInputElement[]
+            const timeoutInputs = Array.from(root.querySelectorAll('input.wait-timeout')) as HTMLInputElement[]
+            if (patternInputs.length > 0) {
+                const domWaits = patternInputs.map((input, index) => {
+                    const pattern = (input.value ?? '').trim() || modelWaits[index]?.pattern || ''
+                    if (!pattern) {
+                        return null
+                    }
+                    const timeout = Number(timeoutInputs[index]?.value ?? modelWaits[index]?.timeout)
+                    return {
+                        pattern,
+                        timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
+                    }
+                })
+                return domWaits.some(wait => wait !== null) ? domWaits : undefined
+            }
+        }
+
+        return modelWaits.some(wait => wait !== null) ? modelWaits : undefined
     }
 
     saveButton(): void {
@@ -1206,6 +2058,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 color: this.modalData.color || undefined,
                 tooltip: this.modalData.tooltip || undefined,
                 sendEnter: this.modalData.sendEnter,
+                waits: this.buildWaitsForSave(),
             })
         } else {
             const commandText = this.modalData.command!.replace(/\r\n?/g, '\n')
@@ -1217,9 +2070,13 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 color: this.modalData.color || undefined,
                 tooltip: this.modalData.tooltip || undefined,
                 sendEnter: this.modalData.sendEnter,
+                waits: this.buildWaitsForSave(),
             }
             list.buttons.push(newButton)
         }
+
+        const savedWaits = this.editingButton?.waits ?? this.activeList?.buttons[this.activeList.buttons.length - 1]?.waits
+        console.log('ButtonBar: saved waits', savedWaits)
 
         try {
             this.saveLists()

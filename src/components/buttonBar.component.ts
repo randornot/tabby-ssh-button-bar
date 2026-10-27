@@ -64,6 +64,9 @@ interface ButtonBarStorage {
                             </div>
                         </ng-container>
                         <div class="list-menu-footer">
+                            <button class="btn-link btn-sm" (click)="openEditLists($event)">
+                                <i class="fas fa-list"></i> Edit lists
+                            </button>
                             <button class="btn-link btn-sm" (click)="openImportExportModal($event)">
                                 <i class="fas fa-cog"></i> Import/Export
                             </button>
@@ -165,10 +168,99 @@ interface ButtonBarStorage {
                 <i class="fas fa-fw fa-copy"></i>
                 <span>Duplicate</span>
             </div>
+            <div class="context-menu-item" (click)="openMoveCopyModal('move')">
+                <i class="fas fa-fw fa-arrow-right"></i>
+                <span>Move to list</span>
+            </div>
+            <div class="context-menu-item" (click)="openMoveCopyModal('copy')">
+                <i class="fas fa-fw fa-clone"></i>
+                <span>Copy to list</span>
+            </div>
             <div class="context-menu-divider"></div>
             <div class="context-menu-item context-menu-item-danger" (click)="contextMenuDelete()">
                 <i class="fas fa-fw fa-trash-alt"></i>
                 <span>Delete</span>
+            </div>
+        </div>
+
+        <!-- Move / Copy to List Modal -->
+        <div class="modal-backdrop" *ngIf="moveCopyModalVisible" (click)="closeMoveCopyModal()"></div>
+        <div class="command-modal" *ngIf="moveCopyModalVisible">
+            <div class="modal-header">
+                <h5>{{ moveCopyMode === 'move' ? 'Move to List' : 'Copy to List' }}</h5>
+                <button class="btn btn-link" (click)="closeMoveCopyModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="move-copy-source" *ngIf="moveCopyButton">{{ moveCopyButton.label }}</div>
+                <div class="list-choice-list">
+                    <button *ngFor="let list of lists"
+                            class="btn btn-secondary list-choice"
+                            [disabled]="list.id === moveCopySourceListId"
+                            (click)="applyMoveCopy(list)">
+                        <span>{{ list.name }}</span>
+                        <small>{{ list.buttons.length }} buttons</small>
+                    </button>
+                </div>
+                <p class="text-muted" *ngIf="lists.length <= 1">Create another list first.</p>
+            </div>
+        </div>
+
+        <!-- Edit Lists Modal -->
+        <div class="modal-backdrop" *ngIf="editListsVisible" (click)="closeEditLists()"></div>
+        <div class="edit-lists-modal" *ngIf="editListsVisible">
+            <div class="modal-header">
+                <h5>Edit Lists</h5>
+                <button class="btn btn-link" (click)="closeEditLists()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body edit-lists-body">
+                <p class="edit-lists-hint text-muted">
+                    Drag a button onto another list. While hovering a list you can choose
+                    <strong>Copy here</strong> or <strong>Move here</strong>.
+                </p>
+                <div class="edit-list-section"
+                     *ngFor="let list of lists"
+                     (dragover)="onEditListDragOver(list, $event)"
+                     (dragleave)="onEditListDragLeave(list, $event)">
+                    <div class="edit-list-title">
+                        <strong>{{ list.name }}</strong>
+                        <span class="edit-list-count">{{ list.buttons.length }}</span>
+                    </div>
+                    <div class="edit-list-buttons">
+                        <div class="edit-button-row"
+                             *ngFor="let btn of list.buttons; trackBy: trackByButton"
+                             draggable="true"
+                             (dragstart)="onEditButtonDragStart(list, btn, $event)"
+                             (dragend)="onEditButtonDragEnd()">
+                            <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
+                            <span class="edit-button-label">{{ btn.label }}</span>
+                            <small class="edit-button-command">{{ btn.command }}</small>
+                        </div>
+                        <div *ngIf="list.buttons.length === 0" class="text-muted edit-list-empty">
+                            No buttons
+                        </div>
+                    </div>
+                    <div class="edit-drop-overlay" *ngIf="isEditDropTarget(list)">
+                        <div class="edit-drop-zone edit-drop-copy"
+                             (dragover)="$event.preventDefault(); $event.stopPropagation()"
+                             (drop)="dropEditButton(list, 'copy', $event)">
+                            <i class="fas fa-clone"></i>
+                            <span>Copy here</span>
+                        </div>
+                        <div class="edit-drop-zone edit-drop-move"
+                             (dragover)="$event.preventDefault(); $event.stopPropagation()"
+                             (drop)="dropEditButton(list, 'move', $event)">
+                            <i class="fas fa-arrow-right"></i>
+                            <span>Move here</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" (click)="closeEditLists()">Close</button>
             </div>
         </div>
 
@@ -359,6 +451,10 @@ interface ButtonBarStorage {
             border-top: 1px solid var(--bs-border-color, #444);
             margin-top: 4px;
             padding-top: 6px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 4px;
         }
 
         .list-menu-footer .btn-sm {
@@ -600,6 +696,182 @@ interface ButtonBarStorage {
             border-top: 1px solid var(--bs-border-color);
         }
 
+        .move-copy-source {
+            font-size: 13px;
+            font-weight: 600;
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: var(--bs-tertiary-bg);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .list-choice-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .list-choice {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            text-align: left;
+        }
+
+        .list-choice small {
+            opacity: 0.7;
+        }
+
+        .edit-lists-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: min(960px, 92vw);
+            max-height: 82vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--bs-body-bg);
+            border: 1px solid var(--bs-border-color);
+            border-radius: 8px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+            z-index: 10001;
+            box-sizing: border-box;
+        }
+
+        .edit-lists-body {
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            align-items: flex-start;
+            flex: 1 1 auto;
+            gap: 12px;
+            overflow-y: auto;
+            min-height: 0;
+        }
+
+        .edit-lists-hint {
+            flex: 0 0 100%;
+            margin: 0 0 4px;
+            font-size: 12px;
+        }
+
+        .edit-list-section {
+            position: relative;
+            flex: 1 1 260px;
+            min-width: 240px;
+            max-width: 460px;
+            border: 1px solid var(--bs-border-color);
+            border-radius: 8px;
+            padding: 10px;
+            background: var(--bs-tertiary-bg, #232323);
+            box-sizing: border-box;
+        }
+
+        .edit-list-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+
+        .edit-list-count {
+            min-width: 20px;
+            padding: 0 6px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.12);
+            text-align: center;
+            font-size: 11px;
+        }
+
+        .edit-list-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-height: 32px;
+        }
+
+        .edit-button-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 8px;
+            border: 1px solid var(--bs-border-color);
+            border-radius: 4px;
+            background: var(--bs-body-bg);
+            cursor: grab;
+            user-select: none;
+            font-size: 12px;
+        }
+
+        .edit-button-row:active {
+            cursor: grabbing;
+        }
+
+        .edit-button-label {
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .edit-button-command {
+            margin-left: auto;
+            max-width: 55%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            opacity: 0.65;
+        }
+
+        .edit-list-empty {
+            font-size: 11px;
+            padding: 4px 2px;
+        }
+
+        .edit-drop-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            gap: 6px;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.72);
+            border-radius: 8px;
+            z-index: 2;
+        }
+
+        .edit-drop-zone {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border: 2px dashed;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: copy;
+        }
+
+        .edit-drop-zone:hover {
+            background: rgba(255,255,255,0.08);
+        }
+
+        .edit-drop-copy {
+            border-color: #0d6efd;
+            color: #6ea8fe;
+        }
+
+        .edit-drop-move {
+            border-color: #198754;
+            color: #75b798;
+        }
+
         .context-menu {
             position: fixed;
             background: var(--bs-body-bg);
@@ -694,6 +966,18 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     // List menu state
     listMenuVisible = false
     listMenuStyles: Record<string, string> = {}
+
+    // Move/Copy to list modal
+    moveCopyModalVisible = false
+    moveCopyMode: 'move' | 'copy' = 'move'
+    moveCopyButton: ButtonCommand | null = null
+    moveCopySourceListId = ''
+
+    // Edit Lists modal (drag buttons between lists)
+    editListsVisible = false
+    editDragButton: ButtonCommand | null = null
+    editDragSourceListId = ''
+    editDragOverListId: string | null = null
 
     // Import/Export modal
     importExportModalVisible = false
@@ -1182,6 +1466,147 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         if (this.contextMenuVisible) {
             this.positionContextMenu()
         }
+    }
+
+    // Move / Copy to list
+    openMoveCopyModal(mode: 'move' | 'copy'): void {
+        if (!this.contextMenuButton) {
+            return
+        }
+        this.moveCopyMode = mode
+        this.moveCopyButton = this.contextMenuButton
+        this.moveCopySourceListId = this.activeListId
+        this.moveCopyModalVisible = true
+        this.closeContextMenu()
+    }
+
+    closeMoveCopyModal(): void {
+        this.moveCopyModalVisible = false
+        this.moveCopyButton = null
+        this.moveCopySourceListId = ''
+    }
+
+    applyMoveCopy(target: ButtonList): void {
+        const source = this.lists.find(list => list.id === this.moveCopySourceListId)
+        const button = this.moveCopyButton
+        if (!source || !button || target.id === source.id) {
+            return
+        }
+
+        if (this.moveCopyMode === 'move') {
+            const index = source.buttons.indexOf(button)
+            if (index === -1) {
+                return
+            }
+            source.buttons.splice(index, 1)
+            target.buttons.push(button)
+        } else {
+            target.buttons.push({
+                ...button,
+                id: this.generateId(),
+            })
+        }
+
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to move/copy button', error)
+        } finally {
+            this.closeMoveCopyModal()
+        }
+    }
+
+    // Edit Lists modal
+    openEditLists(event?: MouseEvent): void {
+        event?.preventDefault()
+        event?.stopPropagation()
+        this.closeListMenu()
+        this.editListsVisible = true
+    }
+
+    closeEditLists(): void {
+        this.clearEditDrag()
+        this.editListsVisible = false
+    }
+
+    onEditButtonDragStart(list: ButtonList, btn: ButtonCommand, event: DragEvent): void {
+        this.editDragButton = btn
+        this.editDragSourceListId = list.id
+        this.editDragOverListId = null
+        if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = 'copyMove'
+            event.dataTransfer.setData('text/plain', btn.id)
+        }
+    }
+
+    onEditButtonDragEnd(): void {
+        this.clearEditDrag()
+    }
+
+    onEditListDragOver(list: ButtonList, event: DragEvent): void {
+        if (!this.editDragButton || list.id === this.editDragSourceListId) {
+            return
+        }
+        event.preventDefault()
+        this.editDragOverListId = list.id
+    }
+
+    onEditListDragLeave(list: ButtonList, event: DragEvent): void {
+        if (this.editDragOverListId !== list.id) {
+            return
+        }
+        const current = event.currentTarget as HTMLElement
+        const related = event.relatedTarget as Node | null
+        if (related && current.contains(related)) {
+            return
+        }
+        this.editDragOverListId = null
+    }
+
+    isEditDropTarget(list: ButtonList): boolean {
+        return this.editDragButton !== null
+            && this.editDragSourceListId !== list.id
+            && this.editDragOverListId === list.id
+    }
+
+    dropEditButton(target: ButtonList, mode: 'move' | 'copy', event: DragEvent): void {
+        event.preventDefault()
+        event.stopPropagation()
+        const button = this.editDragButton
+        const source = this.lists.find(list => list.id === this.editDragSourceListId)
+        if (!button || !source || target.id === source.id) {
+            this.clearEditDrag()
+            return
+        }
+
+        if (mode === 'move') {
+            const index = source.buttons.indexOf(button)
+            if (index === -1) {
+                this.clearEditDrag()
+                return
+            }
+            source.buttons.splice(index, 1)
+            target.buttons.push(button)
+        } else {
+            target.buttons.push({
+                ...button,
+                id: this.generateId(),
+            })
+        }
+
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to apply edit-lists drop', error)
+        } finally {
+            this.clearEditDrag()
+        }
+    }
+
+    private clearEditDrag(): void {
+        this.editDragButton = null
+        this.editDragSourceListId = ''
+        this.editDragOverListId = null
     }
 
     // List operations

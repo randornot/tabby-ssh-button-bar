@@ -11,7 +11,7 @@ import {
 } from 'tabby-core'
 import { BaseTerminalTabComponent } from 'tabby-terminal'
 import path from 'node:path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync } from 'node:fs'
 import { Subject } from 'rxjs'
 import { takeUntil } from 'rxjs/operators'
 
@@ -115,8 +115,8 @@ interface ButtonBarStorage {
                     <input type="text" class="form-control" [(ngModel)]="modalData.label" placeholder="e.g., List Files">
                 </div>
                 <div class="form-group mb-3">
-                    <label class="form-label">Command</label>
-                    <input type="text" class="form-control" [(ngModel)]="modalData.command" placeholder="e.g., ls -la">
+                    <label class="form-label">Command <small class="text-muted">(one command per line)</small></label>
+                    <textarea class="form-control command-textarea" rows="3" [(ngModel)]="modalData.command" placeholder="e.g., adb push ...  (new line)  adb shell ..."></textarea>
                 </div>
                 <div class="form-group mb-3">
                     <label class="form-label">Icon (FontAwesome name, optional)</label>
@@ -426,6 +426,11 @@ interface ButtonBarStorage {
             gap: 4px;
             flex: 1;
             justify-content: flex-start;
+            align-content: flex-start;
+            max-height: min(84px, 24vh);
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding-right: 2px;
         }
 
         .cmd-btn {
@@ -539,6 +544,12 @@ interface ButtonBarStorage {
 
         .form-control {
             font-size: 13px;
+        }
+
+        .command-textarea {
+            font-family: var(--bs-font-monospace, monospace);
+            min-height: 64px;
+            resize: vertical;
         }
 
         .color-picker {
@@ -702,7 +713,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
 
     private destroy$ = new Subject<void>()
     private lastTerminalTab: BaseTerminalTabComponent<any> | null = null
-    private skipNextConfigReload = false
+    private lastConfigSnapshot = ''
     private storagePath?: string | null
     public barService: any = null
 
@@ -727,13 +738,19 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     ngOnInit(): void {
         this.loadLists()
 
+        this.lastConfigSnapshot = this.configSnapshot()
+
         this.config.changed$
             .pipe(takeUntil(this.destroy$))
             .subscribe(() => {
-                if (this.skipNextConfigReload) {
-                    this.skipNextConfigReload = false
+                // Only reload when the button-bar part of the config actually
+                // changed. This also prevents the save -> changed$ -> reload
+                // loop the old skipNextConfigReload flag tried to avoid.
+                const snapshot = this.configSnapshot()
+                if (snapshot === this.lastConfigSnapshot) {
                     return
                 }
+                this.lastConfigSnapshot = snapshot
                 this.loadLists()
             })
 
@@ -759,13 +776,6 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     }
 
     loadLists(): void {
-        const storage = this.loadStorageLists()
-        if (storage?.lists?.length) {
-            this.lists = storage.lists
-            this.activeListId = storage.activeListId || this.lists[0].id
-            return
-        }
-
         const pluginConfig = this.config.store.pluginConfig?.['button-bar'] || {}
 
         // Migration from old format (profiles with groups)
@@ -793,16 +803,40 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             }
         }
 
-        // New format
+        // Single source of truth: the plugin config.
         if (pluginConfig.lists?.length) {
             this.lists = pluginConfig.lists
             this.activeListId = pluginConfig.activeListId || this.lists[0].id
-        } else {
-            // Default
-            this.lists = [this.createDefaultList()]
-            this.activeListId = this.lists[0].id
-            this.saveLists()
+            this.lastConfigSnapshot = this.configSnapshot()
+            // Clean up the legacy duplicate storage file if it is still there.
+            this.markLegacyStorageMigrated()
+            return
         }
+
+        // One-time migration from the old button-bar-lists.json file. New
+        // versions never write this file again; it is only read if the config
+        // has no lists yet, then renamed to *.migrated.
+        const legacy = this.loadLegacyStorage()
+        if (legacy?.lists?.length) {
+            this.lists = legacy.lists
+            this.activeListId = legacy.activeListId || this.lists[0].id
+            this.saveLists()
+            this.markLegacyStorageMigrated()
+            return
+        }
+
+        // Default
+        this.lists = [this.createDefaultList()]
+        this.activeListId = this.lists[0].id
+        this.saveLists()
+    }
+
+    private configSnapshot(): string {
+        const buttonBarConfig = this.config.store.pluginConfig?.['button-bar']
+        return JSON.stringify({
+            lists: buttonBarConfig?.lists ?? [],
+            activeListId: buttonBarConfig?.activeListId ?? '',
+        })
     }
 
     private getStoragePath(): string | null {
@@ -818,7 +852,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         return this.storagePath
     }
 
-    private loadStorageLists(): ButtonBarStorage | null {
+    private loadLegacyStorage(): ButtonBarStorage | null {
         const storagePath = this.getStoragePath()
         if (!storagePath) {
             return null
@@ -830,8 +864,20 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             const content = readFileSync(storagePath, 'utf8')
             return JSON.parse(content) as ButtonBarStorage
         } catch (error) {
-            console.warn('ButtonBar: Unable to read storage file', error)
+            console.warn('ButtonBar: Unable to read legacy storage file', error)
             return null
+        }
+    }
+
+    private markLegacyStorageMigrated(): void {
+        const storagePath = this.getStoragePath()
+        if (!storagePath || !existsSync(storagePath)) {
+            return
+        }
+        try {
+            renameSync(storagePath, `${storagePath}.migrated`)
+        } catch (error) {
+            console.warn('ButtonBar: Unable to rename legacy storage file', error)
         }
     }
 
@@ -843,25 +889,8 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             lists: this.lists,
             activeListId: this.activeListId,
         }
-        this.skipNextConfigReload = true
-        this.saveStorageLists()
+        this.lastConfigSnapshot = this.configSnapshot()
         this.config.save()
-    }
-
-    private saveStorageLists(): void {
-        const storagePath = this.getStoragePath()
-        if (!storagePath) {
-            return
-        }
-        try {
-            mkdirSync(path.dirname(storagePath), { recursive: true })
-            writeFileSync(storagePath, JSON.stringify({
-                lists: this.lists,
-                activeListId: this.activeListId,
-            }, null, 2), 'utf8')
-        } catch (error) {
-            console.warn('ButtonBar: Unable to persist lists', error)
-        }
     }
 
     private createDefaultList(): ButtonList {
@@ -950,12 +979,14 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
 
         setTimeout(() => {
             focusTerminal()
-            const sanitizedCommand = btn.command.replace(/\r?\n/g, ' ')
-            // Enter must be a lone CR (0x0D), not LF (0x0A). Windows ConPTY
-            // translates LF into Ctrl+Enter, which PSReadLine binds to
-            // InsertLineAbove - that only opens a ">>" continuation line and
-            // never submits the command (see issue: PowerShell 7 send-enter).
-            terminal.sendInput(sanitizedCommand + (btn.sendEnter === true ? '\r' : ''))
+            // Normalize newlines, then submit each line with a lone CR (0x0D).
+            // LF (0x0A) is Ctrl+Enter on Windows ConPTY/PSReadLine and would
+            // only open a ">>" continuation line instead of executing.
+            const body = btn.command.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+            const payload = body.split('\n').join('\r') + (btn.sendEnter === true ? '\r' : '')
+            if (payload) {
+                terminal.sendInput(payload)
+            }
             setTimeout(focusTerminal, 20)
         }, 10)
     }
@@ -1151,14 +1182,14 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         if (this.editingButton) {
             Object.assign(this.editingButton, {
                 label: this.modalData.label,
-                command: this.modalData.command?.replace(/\r?\n/g, ' '),
+                command: this.modalData.command?.replace(/\r\n?/g, '\n'),
                 icon: this.modalData.icon || undefined,
                 color: this.modalData.color || undefined,
                 tooltip: this.modalData.tooltip || undefined,
                 sendEnter: this.modalData.sendEnter,
             })
         } else {
-            const commandText = this.modalData.command!.replace(/\r?\n/g, ' ')
+            const commandText = this.modalData.command!.replace(/\r\n?/g, '\n')
             const newButton: ButtonCommand = {
                 id: this.generateId(),
                 label: this.modalData.label!,

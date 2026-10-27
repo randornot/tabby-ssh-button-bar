@@ -12,8 +12,15 @@ import {
 import { BaseTerminalTabComponent } from 'tabby-terminal'
 import path from 'node:path'
 import { existsSync, readFileSync, renameSync } from 'node:fs'
-import { Subject } from 'rxjs'
+import { Subject, Subscription } from 'rxjs'
 import { takeUntil } from 'rxjs/operators'
+
+export interface ButtonWait {
+    /** Substring or regular expression to wait for in the terminal output. */
+    pattern: string
+    /** Timeout in seconds (default 30). */
+    timeout?: number
+}
 
 export interface ButtonCommand {
     id: string
@@ -23,6 +30,8 @@ export interface ButtonCommand {
     icon?: string
     tooltip?: string
     sendEnter?: boolean
+    /** waits[i] applies before sending line i+1 of a multi-line command. */
+    waits?: (ButtonWait | null)[]
 }
 
 export interface ButtonList {
@@ -120,7 +129,26 @@ interface ButtonBarStorage {
                 </div>
                 <div class="form-group mb-3">
                     <label class="form-label">Command <small class="text-muted">(one command per line)</small></label>
-                    <textarea class="form-control command-textarea" rows="3" [(ngModel)]="modalData.command" placeholder="e.g., adb push ...  (new line)  adb shell ..."></textarea>
+                    <textarea class="form-control command-textarea" rows="3"
+                              [ngModel]="modalData.command"
+                              (ngModelChange)="onCommandInput($event)"
+                              placeholder="e.g., adb push ...  (new line)  adb shell ..."></textarea>
+                </div>
+                <div class="form-group mb-3" *ngIf="modalWaitRows.length > 0">
+                    <label class="form-label">Wait for output before next line <small class="text-muted">(optional)</small></label>
+                    <div class="wait-row" *ngFor="let wait of modalWaitRows; let i = index">
+                        <span class="wait-line-label">Line {{ i + 2 }}</span>
+                        <input type="text" class="form-control wait-pattern"
+                               [(ngModel)]="wait.pattern"
+                               placeholder="text or regex, e.g. Password: / 100%">
+                        <input type="number" class="form-control wait-timeout"
+                               [(ngModel)]="wait.timeout" min="1" placeholder="30">
+                        <span class="wait-timeout-unit">s</span>
+                    </div>
+                    <small class="text-muted">
+                        The next line is sent only after terminal output matches (substring or regex).
+                        Timeout aborts the remaining lines (default 30s).
+                    </small>
                 </div>
                 <div class="form-group mb-3">
                     <label class="form-label">Icon (FontAwesome name, optional)</label>
@@ -218,8 +246,8 @@ interface ButtonBarStorage {
             </div>
             <div class="modal-body edit-lists-body">
                 <p class="edit-lists-hint text-muted">
-                    Drag a button onto another list. While hovering a list you can choose
-                    <strong>Copy here</strong> or <strong>Move here</strong>.
+                    Drag a button onto another list to <strong>Copy</strong> or <strong>Move</strong> it.
+                    Drag it between buttons of the same list to reorder.
                 </p>
                 <div class="edit-list-section"
                      *ngFor="let list of lists"
@@ -233,8 +261,13 @@ interface ButtonBarStorage {
                         <div class="edit-button-row"
                              *ngFor="let btn of list.buttons; trackBy: trackByButton"
                              draggable="true"
+                             [class.drop-before]="isEditRowDropTarget(list, btn, 'before')"
+                             [class.drop-after]="isEditRowDropTarget(list, btn, 'after')"
                              (dragstart)="onEditButtonDragStart(list, btn, $event)"
-                             (dragend)="onEditButtonDragEnd()">
+                             (dragend)="onEditButtonDragEnd()"
+                             (dragover)="onEditRowDragOver(list, btn, $event)"
+                             (dragleave)="onEditRowDragLeave(list, btn, $event)"
+                             (drop)="onEditRowDrop(list, btn, $event)">
                             <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
                             <span class="edit-button-label">{{ btn.label }}</span>
                             <small class="edit-button-command">{{ btn.command }}</small>
@@ -655,6 +688,33 @@ interface ButtonBarStorage {
             resize: vertical;
         }
 
+        .wait-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+
+        .wait-line-label {
+            flex: 0 0 52px;
+            font-size: 11px;
+            opacity: 0.7;
+        }
+
+        .wait-pattern {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        .wait-timeout {
+            flex: 0 0 64px;
+        }
+
+        .wait-timeout-unit {
+            font-size: 11px;
+            opacity: 0.7;
+        }
+
         .color-picker {
             display: flex;
             align-items: center;
@@ -814,6 +874,14 @@ interface ButtonBarStorage {
             cursor: grabbing;
         }
 
+        .edit-button-row.drop-before {
+            box-shadow: inset 0 2px 0 var(--bs-primary, #0d6efd);
+        }
+
+        .edit-button-row.drop-after {
+            box-shadow: inset 0 -2px 0 var(--bs-primary, #0d6efd);
+        }
+
         .edit-button-label {
             font-weight: 500;
             white-space: nowrap;
@@ -943,6 +1011,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     // Modal state
     modalVisible = false
     modalData: Partial<ButtonCommand> & { sendEnter?: boolean } = {}
+    modalWaitRows: { pattern: string; timeout?: number }[] = []
     editingButton: ButtonCommand | null = null
 
     // Context menu state
@@ -978,6 +1047,8 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     editDragButton: ButtonCommand | null = null
     editDragSourceListId = ''
     editDragOverListId: string | null = null
+    editDragRowId: string | null = null
+    editDragRowPosition: 'before' | 'after' = 'before'
 
     // Import/Export modal
     importExportModalVisible = false
@@ -1307,20 +1378,105 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             return
         }
 
-        const focusTerminal = () => terminal.frontend?.focus()
-
         setTimeout(() => {
-            focusTerminal()
-            // Normalize newlines, then submit each line with a lone CR (0x0D).
-            // LF (0x0A) is Ctrl+Enter on Windows ConPTY/PSReadLine and would
-            // only open a ">>" continuation line instead of executing.
-            const body = btn.command.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
-            const payload = body.split('\n').join('\r') + (btn.sendEnter === true ? '\r' : '')
-            if (payload) {
-                terminal.sendInput(payload)
-            }
-            setTimeout(focusTerminal, 20)
+            void this.runCommandSteps(terminal, btn).catch(error => {
+                console.error('ButtonBar: command execution failed', error)
+            })
         }, 10)
+    }
+
+    /**
+     * Execute a button command line by line. If a line has a wait
+     * configuration, subscribe to the session output before sending that line
+     * so fast output is not missed, then send the next line only after the
+     * pattern matches (or abort on timeout).
+     */
+    private async runCommandSteps(terminal: BaseTerminalTabComponent<any>, btn: ButtonCommand): Promise<void> {
+        terminal.frontend?.focus()
+        const body = btn.command.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        if (!body) {
+            return
+        }
+        const lines = body.split('\n')
+        const waits = btn.waits ?? []
+
+        for (let i = 0; i < lines.length; i++) {
+            const wait = i < lines.length - 1 ? waits[i] : null
+            const waitPromise = wait?.pattern
+                ? this.waitForOutput(terminal, wait.pattern, (wait.timeout ?? 30) * 1000)
+                : null
+
+            const isLast = i === lines.length - 1
+            const enter = !isLast || btn.sendEnter === true
+            terminal.sendInput(lines[i] + (enter ? '\r' : ''))
+
+            if (waitPromise) {
+                const matched = await waitPromise
+                if (!matched) {
+                    console.warn('ButtonBar: timed out waiting for "' + wait?.pattern + '"')
+                    return
+                }
+            }
+        }
+
+        setTimeout(() => terminal.frontend?.focus(), 20)
+    }
+
+    private waitForOutput(terminal: BaseTerminalTabComponent<any>, pattern: string, timeoutMs: number): Promise<boolean> {
+        return new Promise(resolve => {
+            const session = terminal.session
+            if (!session?.output$) {
+                resolve(false)
+                return
+            }
+
+            let buffer = ''
+            let settled = false
+            let subscription: Subscription | null = null
+            let timer: ReturnType<typeof setTimeout> | null = null
+
+            const finish = (matched: boolean): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                subscription?.unsubscribe()
+                if (timer) {
+                    clearTimeout(timer)
+                }
+                resolve(matched)
+            }
+
+            timer = setTimeout(() => finish(false), Math.max(timeoutMs, 500))
+            subscription = session.output$.subscribe({
+                next: data => {
+                    buffer = (buffer + this.stripAnsi(data)).slice(-65536)
+                    if (this.outputMatches(buffer, pattern)) {
+                        finish(true)
+                    }
+                },
+                error: () => finish(false),
+                complete: () => finish(false),
+            })
+        })
+    }
+
+    private outputMatches(buffer: string, pattern: string): boolean {
+        if (buffer.includes(pattern)) {
+            return true
+        }
+        try {
+            return new RegExp(pattern).test(buffer)
+        } catch {
+            return false
+        }
+    }
+
+    private stripAnsi(text: string): string {
+        return text
+            .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+            .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+            .replace(/\x1b[@-Z\\-_]/g, '')
     }
 
     // Drag-to-reorder
@@ -1549,6 +1705,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         }
         event.preventDefault()
         this.editDragOverListId = list.id
+        this.editDragRowId = null
     }
 
     onEditListDragLeave(list: ButtonList, event: DragEvent): void {
@@ -1567,6 +1724,67 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         return this.editDragButton !== null
             && this.editDragSourceListId !== list.id
             && this.editDragOverListId === list.id
+    }
+
+    onEditRowDragOver(list: ButtonList, btn: ButtonCommand, event: DragEvent): void {
+        if (!this.editDragButton || list.id !== this.editDragSourceListId || btn === this.editDragButton) {
+            return
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+        this.editDragOverListId = null
+        this.editDragRowId = btn.id
+        this.editDragRowPosition = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before'
+    }
+
+    onEditRowDragLeave(list: ButtonList, btn: ButtonCommand, event?: DragEvent): void {
+        if (this.editDragRowId !== btn.id) {
+            return
+        }
+        const current = event?.currentTarget as HTMLElement | null
+        const related = event?.relatedTarget as Node | null
+        if (current && related && current.contains(related)) {
+            return
+        }
+        this.editDragRowId = null
+    }
+
+    isEditRowDropTarget(list: ButtonList, btn: ButtonCommand, position: 'before' | 'after'): boolean {
+        return this.editDragButton !== null
+            && list.id === this.editDragSourceListId
+            && this.editDragRowId === btn.id
+            && this.editDragButton !== btn
+            && this.editDragRowPosition === position
+    }
+
+    onEditRowDrop(list: ButtonList, targetBtn: ButtonCommand, event: DragEvent): void {
+        event.preventDefault()
+        event.stopPropagation()
+        const dragging = this.editDragButton
+        if (!dragging || list.id !== this.editDragSourceListId || dragging === targetBtn) {
+            this.clearEditDrag()
+            return
+        }
+        const from = list.buttons.indexOf(dragging)
+        const targetIndex = list.buttons.indexOf(targetBtn)
+        if (from === -1 || targetIndex === -1) {
+            this.clearEditDrag()
+            return
+        }
+        let insertIndex = targetIndex + (this.editDragRowPosition === 'after' ? 1 : 0)
+        if (from < insertIndex) {
+            insertIndex--
+        }
+        const [moved] = list.buttons.splice(from, 1)
+        list.buttons.splice(insertIndex, 0, moved)
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to reorder button', error)
+        } finally {
+            this.clearEditDrag()
+        }
     }
 
     dropEditButton(target: ButtonList, mode: 'move' | 'copy', event: DragEvent): void {
@@ -1607,6 +1825,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         this.editDragButton = null
         this.editDragSourceListId = ''
         this.editDragOverListId = null
+        this.editDragRowId = null
     }
 
     // List operations
@@ -1718,12 +1937,14 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             tooltip: '',
             sendEnter: false,
         }
+        this.modalWaitRows = []
         this.modalVisible = true
     }
 
     openEditModal(btn: ButtonCommand): void {
         this.editingButton = btn
         this.modalData = { ...btn }
+        this.modalWaitRows = this.buildWaitRows(btn)
         this.modalVisible = true
     }
 
@@ -1731,6 +1952,52 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         this.modalVisible = false
         this.editingButton = null
         this.modalData = {}
+        this.modalWaitRows = []
+    }
+
+    onCommandInput(value: string): void {
+        this.modalData.command = value ?? ''
+        this.syncModalWaitRows()
+    }
+
+    private syncModalWaitRows(): void {
+        const body = (this.modalData.command ?? '').replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        const needed = Math.max(body.split('\n').length - 1, 0)
+        if (this.modalWaitRows.length > needed) {
+            this.modalWaitRows = this.modalWaitRows.slice(0, needed)
+        }
+        while (this.modalWaitRows.length < needed) {
+            this.modalWaitRows.push({ pattern: '', timeout: 30 })
+        }
+    }
+
+    private buildWaitRows(btn: ButtonCommand): { pattern: string; timeout?: number }[] {
+        const body = (btn.command ?? '').replace(/\r\n?/g, '\n').replace(/\n+$/, '')
+        const needed = Math.max(body.split('\n').length - 1, 0)
+        const rows: { pattern: string; timeout?: number }[] = []
+        for (let i = 0; i < needed; i++) {
+            const wait = btn.waits?.[i]
+            rows.push({
+                pattern: wait?.pattern ?? '',
+                timeout: wait?.timeout ?? 30,
+            })
+        }
+        return rows
+    }
+
+    private buildWaitsForSave(): (ButtonWait | null)[] | undefined {
+        const waits = this.modalWaitRows.map(wait => {
+            const pattern = wait.pattern?.trim()
+            if (!pattern) {
+                return null
+            }
+            const timeout = Number(wait.timeout)
+            return {
+                pattern,
+                timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
+            }
+        })
+        return waits.some(wait => wait !== null) ? waits : undefined
     }
 
     saveButton(): void {
@@ -1747,6 +2014,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 color: this.modalData.color || undefined,
                 tooltip: this.modalData.tooltip || undefined,
                 sendEnter: this.modalData.sendEnter,
+                waits: this.buildWaitsForSave(),
             })
         } else {
             const commandText = this.modalData.command!.replace(/\r\n?/g, '\n')
@@ -1758,6 +2026,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 color: this.modalData.color || undefined,
                 tooltip: this.modalData.tooltip || undefined,
                 sendEnter: this.modalData.sendEnter,
+                waits: this.buildWaitsForSave(),
             }
             list.buttons.push(newButton)
         }

@@ -96,6 +96,7 @@ interface ButtonBarStorage {
                                 (contextmenu)="onButtonContextMenu($event, btn)">
                             <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
                             <span>{{ btn.label }}</span>
+                            <i *ngIf="btn.waits?.length" class="fas fa-clock wait-indicator" title="Wait steps configured"></i>
                         </button>
                     </ng-container>
                     <button class="cmd-btn cmd-btn-add" (click)="openAddModal()" title="Add command">
@@ -582,6 +583,12 @@ interface ButtonBarStorage {
 
         .cmd-btn i {
             font-size: 10px;
+        }
+
+        .cmd-btn .wait-indicator {
+            font-size: 8px;
+            opacity: 0.65;
+            margin-left: 1px;
         }
 
         .cmd-btn:hover {
@@ -1093,6 +1100,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         private config: ConfigService,
         private hostApp: HostAppService,
         private platformService: PlatformService,
+        private hostElement: ElementRef<HTMLElement>,
     ) {
         super()
         this.isMacOS = this.hostApp.platform === Platform.macOS
@@ -1392,6 +1400,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
      * pattern matches (or abort on timeout).
      */
     private async runCommandSteps(terminal: BaseTerminalTabComponent<any>, btn: ButtonCommand): Promise<void> {
+        console.log('ButtonBar: executing', btn.label, 'waits=', btn.waits)
         terminal.frontend?.focus()
         const body = btn.command.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
         if (!body) {
@@ -1447,11 +1456,13 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 resolve(matched)
             }
 
+            console.log('ButtonBar: waiting for output', JSON.stringify(pattern))
             timer = setTimeout(() => finish(false), Math.max(timeoutMs, 500))
             subscription = session.output$.subscribe({
                 next: data => {
                     buffer = (buffer + this.stripAnsi(data)).slice(-65536)
                     if (this.outputMatches(buffer, pattern)) {
+                        console.log('ButtonBar: output matched', JSON.stringify(pattern))
                         finish(true)
                     }
                 },
@@ -1995,7 +2006,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     }
 
     private buildWaitsForSave(): (ButtonWait | null)[] | undefined {
-        const waits = this.modalWaitRows.map(wait => {
+        const modelWaits = this.modalWaitRows.map(wait => {
             const pattern = wait.pattern?.trim()
             if (!pattern) {
                 return null
@@ -2006,7 +2017,31 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
             }
         })
-        return waits.some(wait => wait !== null) ? waits : undefined
+
+        // Safety net: read the rendered inputs directly as well. If an
+        // ngModel control in a dynamic *ngFor row has not synced for any
+        // reason, the user-typed text still ends up in the saved command.
+        const root = this.hostElement?.nativeElement
+        if (root) {
+            const patternInputs = Array.from(root.querySelectorAll('input.wait-pattern')) as HTMLInputElement[]
+            const timeoutInputs = Array.from(root.querySelectorAll('input.wait-timeout')) as HTMLInputElement[]
+            if (patternInputs.length > 0) {
+                const domWaits = patternInputs.map((input, index) => {
+                    const pattern = (input.value ?? '').trim() || modelWaits[index]?.pattern || ''
+                    if (!pattern) {
+                        return null
+                    }
+                    const timeout = Number(timeoutInputs[index]?.value ?? modelWaits[index]?.timeout)
+                    return {
+                        pattern,
+                        timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
+                    }
+                })
+                return domWaits.some(wait => wait !== null) ? domWaits : undefined
+            }
+        }
+
+        return modelWaits.some(wait => wait !== null) ? modelWaits : undefined
     }
 
     saveButton(): void {
@@ -2039,6 +2074,9 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             }
             list.buttons.push(newButton)
         }
+
+        const savedWaits = this.editingButton?.waits ?? this.activeList?.buttons[this.activeList.buttons.length - 1]?.waits
+        console.log('ButtonBar: saved waits', savedWaits)
 
         try {
             this.saveLists()

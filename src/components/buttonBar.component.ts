@@ -1700,7 +1700,13 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     }
 
     onEditListDragOver(list: ButtonList, event: DragEvent): void {
-        if (!this.editDragButton || list.id === this.editDragSourceListId) {
+        if (!this.editDragButton) {
+            return
+        }
+        if (list.id === this.editDragSourceListId) {
+            // Returning to the source list: hide a copy/move overlay that may
+            // still be visible on the previous target.
+            this.editDragOverListId = null
             return
         }
         event.preventDefault()
@@ -1727,13 +1733,16 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     }
 
     onEditRowDragOver(list: ButtonList, btn: ButtonCommand, event: DragEvent): void {
-        if (!this.editDragButton || list.id !== this.editDragSourceListId || btn === this.editDragButton) {
+        if (!this.editDragButton || list.id !== this.editDragSourceListId) {
+            return
+        }
+        this.editDragOverListId = null
+        if (btn === this.editDragButton) {
             return
         }
         event.preventDefault()
         event.stopPropagation()
         const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
-        this.editDragOverListId = null
         this.editDragRowId = btn.id
         this.editDragRowPosition = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before'
     }

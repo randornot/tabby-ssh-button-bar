@@ -72,14 +72,15 @@ interface ButtonBarStorage {
                 </div>
                 <div class="button-bar-buttons">
                     <ng-container *ngIf="activeList">
-                        <button *ngFor="let btn of activeList.buttons"
+                        <button *ngFor="let btn of activeList.buttons; trackBy: trackByButton"
                                 class="cmd-btn"
                                 tabindex="-1"
+                                [class.dragging]="draggingButton === btn"
+                                [attr.data-btn-id]="btn.id"
                                 [style.--btn-color]="btn.color || '#4a4a4a'"
                                 [title]="btn.tooltip || btn.command"
                                 (click)="executeCommand(btn, $event)"
-                                (mousedown)="$event.preventDefault()"
-                                (mouseup)="$event.preventDefault()"
+                                (pointerdown)="onButtonPointerDown($event, btn)"
                                 (contextmenu)="onButtonContextMenu($event, btn)">
                             <i *ngIf="btn.icon" class="fas" [ngClass]="'fa-' + btn.icon"></i>
                             <span>{{ btn.label }}</span>
@@ -459,6 +460,12 @@ interface ButtonBarStorage {
             border-color: rgba(255,255,255,0.2);
         }
 
+        .cmd-btn.dragging {
+            opacity: 0.35;
+            outline: 1px dashed var(--bs-primary, #0d6efd);
+            pointer-events: none;
+        }
+
         .cmd-btn-add {
             background: transparent;
             border: 1px dashed var(--bs-border-color, #555);
@@ -675,6 +682,15 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     // Collapse state (collapses to a slim strip with an expand button)
     collapsed = false
 
+    // Drag-to-reorder state (long press, then drag)
+    draggingButton: ButtonCommand | null = null
+    private pendingDragButton: ButtonCommand | null = null
+    private longPressTimer: ReturnType<typeof setTimeout> | null = null
+    private pointerStart = { x: 0, y: 0 }
+    private dragArmed = false
+    private dragMoved = false
+    private suppressClick = false
+
     // List menu state
     listMenuVisible = false
     listMenuStyles: Record<string, string> = {}
@@ -729,10 +745,34 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
 
     @HostListener('document:click', ['$event'])
     onDocumentClick(_event: MouseEvent): void {
+        // Context menu closing is handled on primary pointerdown. Closing it
+        // from "click" made a plain right-click flash the menu closed: in some
+        // environments a secondary click can produce a synthetic click event
+        // after 'contextmenu'.
+        this.closeListMenu()
+    }
+
+    @HostListener('document:pointerdown', ['$event'])
+    onDocumentPointerDown(event: PointerEvent): void {
+        if (event.button !== 0 || !this.contextMenuVisible) {
+            return
+        }
+        if (this.contextMenuElement?.nativeElement.contains(event.target as Node)) {
+            return
+        }
+        this.closeContextMenu()
+    }
+
+    @HostListener('document:keydown.escape')
+    onEscape(): void {
+        this.closeContextMenu()
+        this.closeListMenu()
+    }
+
+    private closeContextMenu(): void {
         this.contextMenuVisible = false
         this.contextMenuStyles = {}
         this.contextMenuAnchor = null
-        this.closeListMenu()
     }
 
     ngOnInit(): void {
@@ -882,13 +922,17 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     }
 
     saveLists(): void {
-        const pluginConfig = this.config.store.pluginConfig || {}
-        this.config.store.pluginConfig = pluginConfig
-        pluginConfig['button-bar'] = {
-            ...(pluginConfig['button-bar'] || {}),
-            lists: this.lists,
-            activeListId: this.activeListId,
+        // ConfigProxy exposes structural members as getter-only proxies, so
+        // replace leaves instead of assigning the whole 'button-bar' object
+        // (that throws a TypeError in strict mode and aborted saveButton()
+        // before closeModal()).
+        const buttonBarConfig = this.config.store.pluginConfig?.['button-bar']
+        if (!buttonBarConfig) {
+            console.warn('ButtonBar: pluginConfig["button-bar"] is missing')
+            return
         }
+        buttonBarConfig.lists = this.lists
+        buttonBarConfig.activeListId = this.activeListId
         this.lastConfigSnapshot = this.configSnapshot()
         this.config.save()
     }
@@ -968,6 +1012,10 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
     executeCommand(btn: ButtonCommand, event?: MouseEvent): void {
         event?.preventDefault()
         event?.stopPropagation()
+        if (this.suppressClick) {
+            this.suppressClick = false
+            return
+        }
         const terminal = this.getActiveTerminalTab()
 
         if (!terminal) {
@@ -989,6 +1037,93 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             }
             setTimeout(focusTerminal, 20)
         }, 10)
+    }
+
+    // Drag-to-reorder
+    trackByButton(_index: number, btn: ButtonCommand): string {
+        return btn.id
+    }
+
+    onButtonPointerDown(event: PointerEvent, btn: ButtonCommand): void {
+        if (event.button !== 0) {
+            return
+        }
+        this.cancelLongPress()
+        this.pendingDragButton = btn
+        this.draggingButton = null
+        this.dragArmed = false
+        this.dragMoved = false
+        this.pointerStart = { x: event.clientX, y: event.clientY }
+        this.longPressTimer = setTimeout(() => {
+            this.longPressTimer = null
+            if (this.pendingDragButton === btn) {
+                this.dragArmed = true
+            }
+        }, 250)
+    }
+
+    @HostListener('document:pointermove', ['$event'])
+    onDocumentPointerMove(event: PointerEvent): void {
+        if (!this.dragArmed || !this.pendingDragButton) {
+            return
+        }
+        const dx = event.clientX - this.pointerStart.x
+        const dy = event.clientY - this.pointerStart.y
+        if (!this.dragMoved && Math.hypot(dx, dy) < 6) {
+            return
+        }
+        if (!this.dragMoved) {
+            this.dragMoved = true
+            this.draggingButton = this.pendingDragButton
+            this.suppressClick = true
+        }
+        this.reorderButtonAtPoint(event.clientX, event.clientY)
+    }
+
+    @HostListener('document:pointerup')
+    @HostListener('document:pointercancel')
+    onDocumentPointerUp(): void {
+        this.cancelLongPress()
+        const wasDragging = this.draggingButton !== null
+        this.draggingButton = null
+        this.pendingDragButton = null
+        this.dragArmed = false
+        this.dragMoved = false
+        if (wasDragging) {
+            this.saveLists()
+            // The click event (if any) is dispatched right after pointerup;
+            // reset the flag afterwards so normal clicks keep working.
+            setTimeout(() => {
+                this.suppressClick = false
+            }, 0)
+        }
+    }
+
+    private cancelLongPress(): void {
+        if (this.longPressTimer) {
+            clearTimeout(this.longPressTimer)
+            this.longPressTimer = null
+        }
+    }
+
+    private reorderButtonAtPoint(x: number, y: number): void {
+        const list = this.activeList
+        const dragging = this.draggingButton
+        if (!list || !dragging) {
+            return
+        }
+        const element = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest('button.cmd-btn') as HTMLElement | null
+        const targetId = element?.dataset.btnId
+        if (!targetId) {
+            return
+        }
+        const from = list.buttons.indexOf(dragging)
+        const to = list.buttons.findIndex(btn => btn.id === targetId)
+        if (from === -1 || to === -1 || from === to) {
+            return
+        }
+        const [moved] = list.buttons.splice(from, 1)
+        list.buttons.splice(to, 0, moved)
     }
 
     // List menu
@@ -1202,8 +1337,13 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             list.buttons.push(newButton)
         }
 
-        this.saveLists()
-        this.closeModal()
+        try {
+            this.saveLists()
+        } catch (error) {
+            console.error('ButtonBar: Unable to save lists', error)
+        } finally {
+            this.closeModal()
+        }
     }
 
     // Context menu
@@ -1284,7 +1424,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
         if (this.contextMenuButton) {
             this.openEditModal(this.contextMenuButton)
         }
-        this.contextMenuVisible = false
+        this.closeContextMenu()
     }
 
     contextMenuDuplicate(): void {
@@ -1297,7 +1437,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
             this.activeList.buttons.push(newButton)
             this.saveLists()
         }
-        this.contextMenuVisible = false
+        this.closeContextMenu()
     }
 
     contextMenuDelete(): void {
@@ -1308,7 +1448,7 @@ export class ButtonBarComponent extends BaseComponent implements OnInit, OnDestr
                 this.saveLists()
             }
         }
-        this.contextMenuVisible = false
+        this.closeContextMenu()
     }
 
     // Import/Export

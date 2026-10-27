@@ -113,12 +113,12 @@ export class ButtonBarService {
     }
 
     private saveVisibility(): void {
-        const pluginConfig = this.config.store.pluginConfig || {}
-        if (!pluginConfig['button-bar']) {
-            pluginConfig['button-bar'] = {}
+        // Mutate the leaf through ConfigProxy; assigning 'button-bar' itself
+        // (a structural member exposed as a getter-only proxy) throws.
+        const buttonBarConfig = this.config.store.pluginConfig?.['button-bar']
+        if (buttonBarConfig) {
+            buttonBarConfig.barVisible = this.visible
         }
-        pluginConfig['button-bar'].barVisible = this.visible
-        this.config.store.pluginConfig = pluginConfig
         this.config.save()
     }
 
